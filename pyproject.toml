@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cmdbench"
-version = "0.2.0" # Increment version as you make changes
+version = "0.3.0"
 authors = [
   { name="Your Name", email="your_email@example.com" }, # Optional: Replace with your details
 ]
-description = "A command-line tool to benchmark commands, measuring execution time, CPU, RAM, and optional GPU usage."
-readme = "README.md" # Optional: if you create a README
+description = "A command-line tool to benchmark and compare commands, measuring execution time, CPU, RAM, and optional GPU usage."
+readme = "README.md"
 requires-python = ">=3.12" # Specify minimum Python version
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Utilities",
     "Environment :: Console",
 ]
-keywords = ["benchmark", "cli", "performance", "cpu", "memory", "gpu", "profiling"]
+keywords = ["benchmark", "compare", "cli", "performance", "cpu", "memory", "gpu", "profiling"]
 
 # Core dependencies needed for basic operation + plotting
 dependencies = [

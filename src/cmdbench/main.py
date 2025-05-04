@@ -8,6 +8,8 @@ import threading
 import os
 import math # For ceil
 import signal # For timeout handling
+import shlex # For splitting command strings safely
+import re # For sanitizing filenames
 from typing import List, Dict, Any, Optional, Tuple
 
 # Optional: Attempt to import pynvml for NVIDIA GPU monitoring
@@ -28,14 +30,15 @@ try:
     PLOTTING_SUPPORT = True
 except ImportError:
     PLOTTING_SUPPORT = False
-    # Define dummy classes/functions if plotting libs are missing to avoid NameErrors later
+    # Define dummy classes/functions if plotting libs are missing
     class np: pass
     class interp1d: pass
     class plt: pass
 
 
-# --- Monitoring Thread ---
+# --- ResourceMonitor Class ---
 # (ResourceMonitor class remains the same as in the previous version)
+# ... (Keep the full ResourceMonitor class here) ...
 class ResourceMonitor:
     """Monitors CPU, RAM, and optionally GPU usage of a process."""
 
@@ -89,8 +92,6 @@ class ResourceMonitor:
             return
 
         self.monitor_start_time = time.perf_counter()
-        # Call cpu_percent once outside loop if interval=0 to establish baseline
-        # self._process.cpu_percent(interval=None)
 
         while not self._stop_event.is_set():
             current_time = time.perf_counter()
@@ -128,7 +129,7 @@ class ResourceMonitor:
                         if "last_nvml_error" not in self.__dict__ or self.last_nvml_error != str(e):
                              print(f"Warning: NVML Error during monitoring: {e}", file=sys.stderr)
                              self.last_nvml_error = str(e)
-                        gpu_util = 0.0 # Or NaN? Or previous value? 0 seems reasonable.
+                        gpu_util = 0.0
                         gpu_mem_mb = 0.0
 
                 # --- Append results ---
@@ -173,7 +174,6 @@ class ResourceMonitor:
         if self._thread:
             self._thread.join(timeout=self.interval * 2 + 1) # Add timeout for join
 
-        # Aggregate results for summary
         summary = {}
         for key, values in self.results.items():
             if key == "timestamps_rel_s": continue
@@ -203,31 +203,35 @@ class ResourceMonitor:
 
 
 # --- Plotting Functions ---
+def sanitize_filename(name: str, max_len: int = 50) -> str:
+    """Basic sanitization for filenames derived from commands."""
+    # Remove potentially problematic characters
+    sanitized = re.sub(r'[<>:"/\\|?*\s]+', '_', name)
+    # Limit length
+    return sanitized[:max_len]
 
-def generate_plot(run_index: int, total_runs: int, timeseries_data: Dict[str, List[float]], output_filename: str, command_str: str):
+# Updated plotting functions to accept command_index and command_str
+def generate_plot(command_index: int, run_index: int, total_runs: int, timeseries_data: Dict[str, List[float]], output_filename: str, command_str: str):
     """Generates a plot of resource usage over time for a single run."""
-    if not PLOTTING_SUPPORT:
-        # This check should ideally happen before calling, but double-check
-        return
+    if not PLOTTING_SUPPORT: return
 
     timestamps = timeseries_data.get("timestamps_rel_s", [])
     if not timestamps or len(timestamps) < 2:
-        print(f"Warning: Not enough data points for Run {run_index} to generate plot.", file=sys.stderr)
+        print(f"Warning: [Cmd {command_index+1}] Not enough data points for Run {run_index} to generate plot.", file=sys.stderr)
         return
 
+    # ... [Rest of plotting logic is the same, but update title] ...
     cpu_usage = timeseries_data.get("cpu_percent", [])
     mem_usage = timeseries_data.get("memory_rss_mb", [])
     gpu_util = timeseries_data.get("gpu_utilization_percent", [])
     gpu_mem = timeseries_data.get("gpu_memory_used_mb", [])
-
-    # Check if GPU data exists and has non-zero values (optional check)
     has_meaningful_gpu_data = (gpu_util or gpu_mem) and (any(v > 0 for v in gpu_util if isinstance(v, (int, float))) or any(v > 0 for v in gpu_mem if isinstance(v, (int, float))))
 
     fig, ax1 = plt.subplots(figsize=(12, 6))
     ax2 = ax1.twinx()
 
-    title_str = f"Resource Usage: Run {run_index}/{total_runs}\nCommand: {command_str[:80]}{'...' if len(command_str)>80 else ''}"
-    fig.suptitle(title_str, fontsize=12)
+    title_str = f"Cmd {command_index+1} - Run {run_index}/{total_runs}: Resource Usage\n`{command_str[:80]}{'...' if len(command_str)>80 else ''}`"
+    fig.suptitle(title_str, fontsize=11) # Smaller font size
     ax1.set_xlabel("Time (s)")
 
     color_cpu = 'tab:red'
@@ -237,9 +241,12 @@ def generate_plot(run_index: int, total_runs: int, timeseries_data: Dict[str, Li
         color_gpu_util = 'tab:purple'
         l2 = ax1.plot(timestamps, gpu_util, color=color_gpu_util, linestyle='--', label="Avg GPU Utilization (%)")
     ax1.tick_params(axis='y', labelcolor=color_cpu)
-    # Dynamic Y axis, ensuring 0 is visible and top has some margin
-    max_y1 = max(105, math.ceil(max(cpu_usage + (gpu_util if has_meaningful_gpu_data else [])) / 10.0) * 10 if cpu_usage or has_meaningful_gpu_data else 105)
+    max_y1_val = 0
+    if cpu_usage: max_y1_val = max(max_y1_val, max(cpu_usage))
+    if has_meaningful_gpu_data and gpu_util: max_y1_val = max(max_y1_val, max(gpu_util))
+    max_y1 = max(105, math.ceil(max_y1_val / 10.0) * 10 if max_y1_val > 0 else 105)
     ax1.set_ylim(bottom=0, top=max_y1)
+
 
     color_mem = 'tab:blue'
     ax2.set_ylabel("Memory Usage (MB)", color=color_mem)
@@ -248,12 +255,12 @@ def generate_plot(run_index: int, total_runs: int, timeseries_data: Dict[str, Li
          color_gpu_mem = 'tab:cyan'
          l4 = ax2.plot(timestamps, gpu_mem, color=color_gpu_mem, linestyle='--', label="Avg GPU Memory Used (MB)")
     ax2.tick_params(axis='y', labelcolor=color_mem)
-    # Dynamic Y axis, ensuring 0 is visible and top has some margin
-    max_y2 = max(50, math.ceil(max(mem_usage + (gpu_mem if has_meaningful_gpu_data else [])) / 50.0) * 50 if mem_usage or has_meaningful_gpu_data else 50)
+    max_y2_val = 0
+    if mem_usage: max_y2_val = max(max_y2_val, max(mem_usage))
+    if has_meaningful_gpu_data and gpu_mem: max_y2_val = max(max_y2_val, max(gpu_mem))
+    max_y2 = max(50, math.ceil(max_y2_val / 50.0) * 50 if max_y2_val > 0 else 50)
     ax2.set_ylim(bottom=0, top=max_y2)
 
-
-    # Combine legends
     lines = l1
     if has_meaningful_gpu_data: lines += l2
     lines += l3
@@ -271,106 +278,72 @@ def generate_plot(run_index: int, total_runs: int, timeseries_data: Dict[str, Li
     finally:
         plt.close(fig)
 
-def generate_average_plot(run_results: List[Dict], output_filename: str, command_str: str):
-    """Generates a plot showing the average resource usage across all runs."""
-    if not PLOTTING_SUPPORT:
-        return # Should have been checked earlier
+
+def generate_average_plot(command_index: int, run_results: List[Dict], output_filename: str, command_str: str):
+    """Generates a plot showing the average resource usage across all runs for a specific command."""
+    if not PLOTTING_SUPPORT: return
 
     valid_runs_data = [r for r in run_results if r.get('timeseries') and len(r['timeseries'].get('timestamps_rel_s', [])) >= 2]
-
     if not valid_runs_data:
-        print("Warning: No valid run data with sufficient timeseries to generate average plot.", file=sys.stderr)
+        print(f"Warning: [Cmd {command_index+1}] No valid run data for average plot.", file=sys.stderr)
         return
 
     num_runs = len(valid_runs_data)
-    print(f"\nGenerating average plot from {num_runs} successful run(s)...", file=sys.stderr)
+    print(f"\n[Cmd {command_index+1}] Generating average plot from {num_runs} successful run(s)...", file=sys.stderr)
 
-    # Determine the common time axis based on the longest run duration
+    # ... [Interpolation logic remains the same] ...
     max_duration = 0
     for r in valid_runs_data:
         ts = r['timeseries']['timestamps_rel_s']
-        if ts:
-            max_duration = max(max_duration, ts[-1])
+        if ts: max_duration = max(max_duration, ts[-1])
+    if max_duration == 0: return
 
-    if max_duration == 0:
-        print("Warning: Max duration is 0, cannot generate average plot.", file=sys.stderr)
-        return
-
-    # Define common time points for interpolation (e.g., 200 points)
     num_points = 200
     common_time = np.linspace(0, max_duration, num_points)
-
-    # Store interpolated data for each metric from all runs
-    interpolated_data = {
-        "cpu_percent": [],
-        "memory_rss_mb": [],
-        "gpu_utilization_percent": [],
-        "gpu_memory_used_mb": []
-    }
+    interpolated_data = { k: [] for k in ["cpu_percent", "memory_rss_mb", "gpu_utilization_percent", "gpu_memory_used_mb"] }
     metrics_to_plot = list(interpolated_data.keys())
-    has_any_gpu_data = False # Track if any run had meaningful GPU data
+    has_any_gpu_data = False
 
     for run_data in valid_runs_data:
         timeseries = run_data['timeseries']
         timestamps = timeseries['timestamps_rel_s']
         run_has_gpu = any(v > 0 for v in timeseries.get('gpu_utilization_percent', []) if isinstance(v, (int, float))) or \
                       any(v > 0 for v in timeseries.get('gpu_memory_used_mb', []) if isinstance(v, (int, float)))
-        if run_has_gpu:
-            has_any_gpu_data = True
+        if run_has_gpu: has_any_gpu_data = True
 
         for metric in metrics_to_plot:
             values = timeseries.get(metric, [])
-            if len(timestamps) != len(values):
-                 print(f"Warning: Mismatch length ts({len(timestamps)}) vs {metric}({len(values)}) in a run. Skipping metric for average plot.", file=sys.stderr)
-                 # Pad interpolated with NaNs or handle differently? For now, just skip appending bad data.
-                 continue
-
-            # Create interpolation function for this run's metric
-            # Use linear interpolation, fill with 0 beyond run's end time
+            if len(timestamps) != len(values): continue
             try:
                  interp_func = interp1d(timestamps, values, kind='linear', bounds_error=False, fill_value=0)
-                 # Evaluate interpolation function on the common time axis
                  interpolated_values = interp_func(common_time)
                  interpolated_data[metric].append(interpolated_values)
             except ValueError as e:
-                 print(f"Warning: Interpolation error for metric '{metric}' in a run: {e}. Skipping.", file=sys.stderr)
-                 # Append NaNs to keep array sizes consistent if needed, or filter later
-                 # interpolated_data[metric].append(np.full(common_time.shape, np.nan))
+                 print(f"Warning: [Cmd {command_index+1}] Interpolation error for '{metric}': {e}. Skipping for average plot.", file=sys.stderr)
 
-
-    # Calculate average and standard deviation for each metric
     averages = {}
     std_devs = {}
     valid_metrics = []
-
     for metric, data_list in interpolated_data.items():
-        if len(data_list) == num_runs: # Ensure all runs contributed data for this metric
+        if len(data_list) == num_runs:
             stacked_data = np.vstack(data_list)
             averages[metric] = np.mean(stacked_data, axis=0)
             std_devs[metric] = np.std(stacked_data, axis=0)
             valid_metrics.append(metric)
-        elif data_list: # Some runs contributed, but not all (due to errors)
-             print(f"Warning: Metric '{metric}' only has data from {len(data_list)}/{num_runs} runs. Average might be skewed.", file=sys.stderr)
-             # Could still average, but be cautious:
-             # stacked_data = np.vstack(data_list)
-             # averages[metric] = np.nanmean(stacked_data, axis=0) # Use nanmean if NaNs were inserted
-             # std_devs[metric] = np.nanstd(stacked_data, axis=0)
-             # valid_metrics.append(metric)
-        else:
-             print(f"Info: No data collected for metric '{metric}' across runs for average plot.", file=sys.stderr)
+        elif data_list: # Inconsistent data across runs
+             print(f"Warning: [Cmd {command_index+1}] Metric '{metric}' only has data from {len(data_list)}/{num_runs} runs for avg plot.", file=sys.stderr)
 
 
-    # Plotting the averages
-    fig, ax1 = plt.subplots(figsize=(12, 7)) # Slightly taller for std dev bands
+    # ... [Plotting averages logic is the same, but update title] ...
+    fig, ax1 = plt.subplots(figsize=(12, 7))
     ax2 = ax1.twinx()
 
-    title_str = f"Average Resource Usage ({num_runs} Runs)\nCommand: {command_str[:80]}{'...' if len(command_str)>80 else ''}"
-    fig.suptitle(title_str, fontsize=12)
+    title_str = f"Cmd {command_index+1} - Average Resource Usage ({num_runs} Runs)\n`{command_str[:80]}{'...' if len(command_str)>80 else ''}`"
+    fig.suptitle(title_str, fontsize=11)
     ax1.set_xlabel("Time (s)")
 
-    lines = [] # Collect lines for legend
-
-    # Plot CPU and GPU Utilization (Avg +/- Std Dev) on ax1
+    lines = []
+    max_y1_val = 0
     color_cpu = 'tab:red'
     ax1.set_ylabel("Avg CPU / GPU Utilization (%)", color=color_cpu)
     if 'cpu_percent' in valid_metrics:
@@ -379,9 +352,7 @@ def generate_average_plot(run_results: List[Dict], output_filename: str, command
         l1 = ax1.plot(common_time, avg_cpu, color=color_cpu, label="Avg CPU Usage (%)")
         ax1.fill_between(common_time, avg_cpu - std_cpu, avg_cpu + std_cpu, color=color_cpu, alpha=0.2, label='_nolegend_')
         lines.extend(l1)
-    max_y1_val = 0
-    if 'cpu_percent' in valid_metrics: max_y1_val = max(max_y1_val, np.max(averages['cpu_percent'] + std_devs['cpu_percent']))
-
+        max_y1_val = max(max_y1_val, np.max(avg_cpu + std_cpu))
 
     color_gpu_util = 'tab:purple'
     if has_any_gpu_data and 'gpu_utilization_percent' in valid_metrics:
@@ -390,25 +361,21 @@ def generate_average_plot(run_results: List[Dict], output_filename: str, command
         l2 = ax1.plot(common_time, avg_gpu_util, color=color_gpu_util, linestyle='--', label="Avg GPU Utilization (%)")
         ax1.fill_between(common_time, avg_gpu_util - std_gpu_util, avg_gpu_util + std_gpu_util, color=color_gpu_util, alpha=0.2, label='_nolegend_')
         lines.extend(l2)
-        if 'gpu_utilization_percent' in valid_metrics: max_y1_val = max(max_y1_val, np.max(averages['gpu_utilization_percent'] + std_devs['gpu_utilization_percent']))
-
+        max_y1_val = max(max_y1_val, np.max(avg_gpu_util + std_gpu_util))
 
     ax1.tick_params(axis='y', labelcolor=color_cpu)
     ax1.set_ylim(bottom=0, top=max(105, math.ceil(max_y1_val / 10.0) * 10 if max_y1_val > 0 else 105))
 
-
-    # Plot Memory Usage (Avg +/- Std Dev) on ax2
+    max_y2_val = 0
     color_mem = 'tab:blue'
     ax2.set_ylabel("Avg Memory Usage (MB)", color=color_mem)
-    max_y2_val = 0
     if 'memory_rss_mb' in valid_metrics:
         avg_mem = averages['memory_rss_mb']
         std_mem = std_devs['memory_rss_mb']
         l3 = ax2.plot(common_time, avg_mem, color=color_mem, label="Avg RAM RSS (MB)")
         ax2.fill_between(common_time, avg_mem - std_mem, avg_mem + std_mem, color=color_mem, alpha=0.2, label='_nolegend_')
         lines.extend(l3)
-        if 'memory_rss_mb' in valid_metrics: max_y2_val = max(max_y2_val, np.max(averages['memory_rss_mb'] + std_devs['memory_rss_mb']))
-
+        max_y2_val = max(max_y2_val, np.max(avg_mem + std_mem))
 
     color_gpu_mem = 'tab:cyan'
     if has_any_gpu_data and 'gpu_memory_used_mb' in valid_metrics:
@@ -417,17 +384,14 @@ def generate_average_plot(run_results: List[Dict], output_filename: str, command
          l4 = ax2.plot(common_time, avg_gpu_mem, color=color_gpu_mem, linestyle='--', label="Avg GPU Memory Used (MB)")
          ax2.fill_between(common_time, avg_gpu_mem - std_gpu_mem, avg_gpu_mem + std_gpu_mem, color=color_gpu_mem, alpha=0.2, label='_nolegend_')
          lines.extend(l4)
-         if 'gpu_memory_used_mb' in valid_metrics: max_y2_val = max(max_y2_val, np.max(averages['gpu_memory_used_mb'] + std_devs['gpu_memory_used_mb']))
+         max_y2_val = max(max_y2_val, np.max(avg_gpu_mem + std_gpu_mem))
 
     ax2.tick_params(axis='y', labelcolor=color_mem)
     ax2.set_ylim(bottom=0, top=max(50, math.ceil(max_y2_val / 50.0) * 50 if max_y2_val > 0 else 50))
 
-
-    # Combine legends
     labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=min(len(labels), 4)) # Legend below plot
-
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout
+    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=min(len(labels), 4))
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     try:
         plt.savefig(output_filename, dpi=100)
@@ -439,10 +403,10 @@ def generate_average_plot(run_results: List[Dict], output_filename: str, command
 
 
 # --- Utility Functions ---
-# (format_duration function remains the same)
+# (format_duration remains the same)
 def format_duration(seconds: float) -> str:
     """Formats duration in a human-readable way."""
-    if seconds < 0: return "N/A" # Handle timeout case where duration might be negative temporarily
+    if seconds < 0 or math.isnan(seconds): return "N/A"
     if seconds < 1:
         return f"{seconds * 1000:.2f} ms"
     elif seconds < 60:
@@ -452,15 +416,21 @@ def format_duration(seconds: float) -> str:
         secs = seconds % 60
         return f"{minutes}m {secs:.3f}s"
 
-# (run_command function remains the same as previous version with plotting)
-def run_command(command: List[str], run_index: int, total_runs: int, is_warmup: bool = False, monitor_interval: float = 0.1, monitor_gpu: bool = False, timeout: Optional[float] = None, verbose_level: int = 0) -> Tuple[Optional[float], Optional[Dict[str, Any]], Optional[Dict[str, List[float]]], Optional[int]]:
+
+# (run_command remains mostly the same, but takes List[str] directly)
+def run_command(command_list: List[str], # Takes list directly now
+                command_str: str, # Keep string for printing
+                run_prefix: str, # Pass prefix for consistent logging
+                monitor_interval: float = 0.1,
+                monitor_gpu: bool = False,
+                timeout: Optional[float] = None,
+                verbose_level: int = 0
+                ) -> Tuple[Optional[float], Optional[Dict[str, Any]], Optional[Dict[str, List[float]]], Optional[int]]:
     """
     Runs the command once and monitors it.
     Returns (duration, resource_summary, raw_timeseries, return_code).
-    Returns None for components if errors occur.
     """
-    prefix = "[Warmup]" if is_warmup else f"[Run {run_index}/{total_runs}]"
-    print(f"{prefix} Executing: {' '.join(command)}", file=sys.stderr)
+    print(f"{run_prefix} Executing: {command_str}", file=sys.stderr)
 
     monitor = None
     resource_summary = None
@@ -468,12 +438,15 @@ def run_command(command: List[str], run_index: int, total_runs: int, is_warmup: 
     return_code = None
     duration = None
     timed_out = False
+    stdout = ""
+    stderr = ""
+    process = None # Initialize process to None
 
     try:
         start_time = time.perf_counter()
         preexec_fn = os.setsid if sys.platform != "win32" else None
         process = subprocess.Popen(
-            command,
+            command_list, # Use the list here
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -491,35 +464,24 @@ def run_command(command: List[str], run_index: int, total_runs: int, is_warmup: 
             return_code = process.returncode
         except subprocess.TimeoutExpired:
              timed_out = True
-             print(f"\n{prefix} Command timed out after {timeout} seconds. Terminating process group...", file=sys.stderr)
+             print(f"\n{run_prefix} Command timed out after {timeout} seconds. Terminating process group...", file=sys.stderr)
              pgid = -1
              try:
                  if sys.platform != "win32":
                      pgid = os.getpgid(process.pid)
                      os.killpg(pgid, signal.SIGTERM)
                  else:
-                     # Use taskkill on Windows for better child process termination
                      subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], check=False, capture_output=True)
-                     # process.terminate() # Fallback
-             except ProcessLookupError: pass # Process already gone
-             except Exception as term_err:
-                 print(f"{prefix} Error during SIGTERM/taskkill: {term_err}", file=sys.stderr)
-
-             # Wait briefly then force kill if needed
-             try:
-                 process.wait(timeout=1.5)
+             except Exception as term_err: pass # Ignore termination errors initially
+             try: process.wait(timeout=1.5)
              except subprocess.TimeoutExpired:
-                 print(f"{prefix} Force killing...", file=sys.stderr)
+                 print(f"{run_prefix} Force killing...", file=sys.stderr)
                  try:
-                     if sys.platform != "win32" and pgid > 0:
-                         os.killpg(pgid, signal.SIGKILL)
-                     else:
-                         process.kill()
-                 except Exception as kill_err:
-                      print(f"{prefix} Error during SIGKILL: {kill_err}", file=sys.stderr)
-
-             stdout, stderr = process.communicate() # Get any remaining output
-             return_code = -9 # Convention for SIGKILL/Timeout
+                     if sys.platform != "win32" and pgid > 0: os.killpg(pgid, signal.SIGKILL)
+                     else: process.kill()
+                 except Exception: pass # Ignore kill errors
+             stdout, stderr = process.communicate() # Get remaining output
+             return_code = -9 # Timeout code
              duration = timeout
 
         if duration is None:
@@ -538,26 +500,26 @@ def run_command(command: List[str], run_index: int, total_runs: int, is_warmup: 
 
         # Verbose output
         if verbose_level > 1:
-             print(f"{prefix} --- STDOUT ({len(stdout)} bytes) ---", file=sys.stderr)
+             print(f"{run_prefix} --- STDOUT ({len(stdout)} bytes) ---", file=sys.stderr)
              print(stdout, file=sys.stderr)
-             print(f"{prefix} --- STDERR ({len(stderr)} bytes) ---", file=sys.stderr)
+             print(f"{run_prefix} --- STDERR ({len(stderr)} bytes) ---", file=sys.stderr)
              print(stderr, file=sys.stderr)
-             print(f"{prefix} --- End Output ---", file=sys.stderr)
+             print(f"{run_prefix} --- End Output ---", file=sys.stderr)
         elif verbose_level > 0 and (stdout or stderr):
-             print(f"{prefix} Output captured ({len(stdout)} bytes stdout, {len(stderr)} bytes stderr). Use -vv to view.", file=sys.stderr)
+             print(f"{run_prefix} Output captured ({len(stdout)} bytes stdout, {len(stderr)} bytes stderr). Use -vv to view.", file=sys.stderr)
 
         if return_code != 0 and not timed_out:
-            print(f"{prefix} Warning: Command exited with non-zero status: {return_code}", file=sys.stderr)
+            print(f"{run_prefix} Warning: Command exited with non-zero status: {return_code}", file=sys.stderr)
 
     except FileNotFoundError:
-        print(f"Error: Command not found: {command[0]}", file=sys.stderr)
+        print(f"{run_prefix} Error: Command not found: {command_list[0]}", file=sys.stderr)
         return None, None, None, None
     except PermissionError:
-         print(f"Error: Permission denied executing: {command[0]}", file=sys.stderr)
+         print(f"{run_prefix} Error: Permission denied executing: {command_list[0]}", file=sys.stderr)
          return None, None, None, None
     except Exception as e:
-        print(f"{prefix} Error running or monitoring command: {e}", file=sys.stderr)
-        if 'process' in locals() and process.poll() is None:
+        print(f"{run_prefix} Error running or monitoring command: {e}", file=sys.stderr)
+        if process and process.poll() is None:
              try: process.kill()
              except Exception: pass
         if monitor_started:
@@ -568,24 +530,52 @@ def run_command(command: List[str], run_index: int, total_runs: int, is_warmup: 
     return duration, resource_summary, raw_timeseries, return_code
 
 
-# --- Main Execution ---
+def calculate_summary_stats(run_results: List[Dict], command_str: str) -> Dict[str, Any]:
+    """Calculates summary statistics for a list of runs for one command."""
+    summary_stats = {"command": command_str, "runs": len(run_results), "successful_runs": 0}
+    if not run_results:
+        return summary_stats
 
+    valid_durations = [r['duration_s'] for r in run_results if r.get('duration_s') is not None]
+    summary_stats["successful_runs"] = len(valid_durations)
+
+    if not valid_durations:
+        return summary_stats
+
+    summary_stats["time_avg_s"] = statistics.mean(valid_durations)
+    summary_stats["time_min_s"] = min(valid_durations)
+    summary_stats["time_max_s"] = max(valid_durations)
+    summary_stats["time_stdev_s"] = statistics.stdev(valid_durations) if len(valid_durations) > 1 else 0.0
+
+    def aggregate_summary_stat(key):
+        values = [r['summary'].get(key) for r in run_results if r.get('summary') and r['summary'].get(key) is not None and math.isfinite(r['summary'].get(key))]
+        return statistics.mean(values) if values else float('nan')
+
+    summary_stats["cpu_avg_avg"] = aggregate_summary_stat('cpu_percent_avg')
+    summary_stats["cpu_max_avg"] = aggregate_summary_stat('cpu_percent_max')
+    summary_stats["mem_avg_avg"] = aggregate_summary_stat('memory_rss_mb_avg')
+    summary_stats["mem_max_avg"] = aggregate_summary_stat('memory_rss_mb_max')
+
+    # Aggregate GPU stats if available in summaries
+    summary_stats["gpu_util_avg_avg"] = aggregate_summary_stat('gpu_utilization_percent_avg')
+    summary_stats["gpu_util_max_avg"] = aggregate_summary_stat('gpu_utilization_percent_max')
+    summary_stats["gpu_mem_avg_avg"] = aggregate_summary_stat('gpu_memory_used_mb_avg')
+    summary_stats["gpu_mem_max_avg"] = aggregate_summary_stat('gpu_memory_used_mb_max')
+
+    return summary_stats
+
+
+# --- Main Logic ---
 def run_benchmark_logic(args):
-    """Main function to parse args and run benchmarks."""
-    command_to_run = args.command
-    if not command_to_run:
-        print("Error: No command provided to benchmark.", file=sys.stderr)
-        sys.exit(1)
+    """Main logic function containing the benchmark execution flow."""
+    command_strings = args.command # Now a list of strings
+    num_commands = len(command_strings)
 
-    command_str_short = ' '.join(command_to_run)
-
-    print(f"Benchmarking command: {command_str_short}")
-    # ... [Print other config like runs, warmup, interval, timeout] ...
-    print(f"Number of runs: {args.runs}")
-    if args.warmup > 0: print(f"Warm-up runs: {args.warmup}")
+    print(f"Benchmarking {num_commands} command(s)...")
+    print(f"Number of runs per command: {args.runs}")
+    if args.warmup > 0: print(f"Warm-up runs per command: {args.warmup}")
     print(f"Monitoring interval: {args.interval}s")
     if args.timeout: print(f"Timeout per run: {args.timeout}s")
-
 
     # Plotting setup
     plot_dir = args.plot_dir
@@ -602,9 +592,9 @@ def run_benchmark_logic(args):
                 plot_dir = None
 
     # GPU Status
-    # ... [GPU status print remains the same] ...
     gpu_status = "Disabled"
-    if args.gpu:
+    gpu_enabled_arg = args.gpu
+    if gpu_enabled_arg:
         if NVIDIA_GPU_SUPPORT:
             try:
                 count = pynvml.nvmlDeviceGetCount()
@@ -614,182 +604,228 @@ def run_benchmark_logic(args):
         else:
             gpu_status = "Enabled attempt, but pynvml not found or failed to load."
     print(f"GPU Monitoring: {gpu_status}")
-    print("-" * 20, file=sys.stderr)
 
 
-    # --- Warm-up Runs ---
-    if args.warmup > 0:
-        print("Starting warm-up runs...", file=sys.stderr)
-        for i in range(args.warmup):
-            run_command(command_to_run, i + 1, args.warmup, is_warmup=True,
-                        monitor_interval=args.interval, monitor_gpu=args.gpu,
-                        timeout=args.timeout, verbose_level=args.verbose)
-        print("Warm-up complete.", file=sys.stderr)
+    all_results = {} # Store results per command string: {cmd_str: [run_result1, run_result2,...]}
+
+    # --- Loop through each command ---
+    for cmd_idx, command_str in enumerate(command_strings):
         print("-" * 20, file=sys.stderr)
+        print(f"Benchmarking Command {cmd_idx+1}/{num_commands}: `{command_str}`", file=sys.stderr)
 
-    # --- Benchmark Runs ---
-    run_results = []
-    print("Starting benchmark runs...", file=sys.stderr)
-    for i in range(args.runs):
-        duration, summary, timeseries, exit_code = run_command(
-            command_to_run, i + 1, args.runs, is_warmup=False,
-            monitor_interval=args.interval, monitor_gpu=args.gpu,
-            timeout=args.timeout, verbose_level=args.verbose
-            )
-
-        if duration is None or summary is None or timeseries is None or exit_code is None:
-             print(f"[Run {i+1}/{args.runs}] Failed. Skipping results and plot for this run.", file=sys.stderr)
-             continue
-
-        run_data = {
-            "run": i + 1,
-            "duration_s": duration,
-            "exit_code": exit_code,
-            "summary": summary,
-            "timeseries": timeseries
-        }
-        run_results.append(run_data)
-
-        # Print intermediate result summary
-        res_str = f"Time: {format_duration(duration)}, CPU Max: {summary.get('cpu_percent_max', 'N/A'):.1f}%, Mem Max: {summary.get('memory_rss_mb_max', 'N/A'):.1f} MB"
-        gpu_max_util = summary.get('gpu_utilization_percent_max', float('nan'))
-        gpu_max_mem = summary.get('gpu_memory_used_mb_max', float('nan'))
-        if args.gpu and NVIDIA_GPU_SUPPORT and not math.isnan(gpu_max_util):
-             res_str += f", GPU Max: {gpu_max_util:.1f}%, GPU Mem Max: {gpu_max_mem:.1f} MB"
-        if summary.get("monitoring_error"):
-             res_str += f" (Monitor Warn: {summary['monitoring_error']})"
-        print(f"[Run {i+1}/{args.runs}] {res_str}")
+        # Use shlex to split command string safely for different OS
+        try:
+            command_list = shlex.split(command_str)
+            if not command_list:
+                 print(f"Warning: Command {cmd_idx+1} is empty. Skipping.", file=sys.stderr)
+                 all_results[command_str] = [] # Store empty results
+                 continue
+        except ValueError as e:
+            print(f"Error parsing command {cmd_idx+1}: {command_str}\n -> {e}. Skipping.", file=sys.stderr)
+            all_results[command_str] = []
+            continue
 
 
-        # Generate plot for this run if requested
-        if plot_dir:
-            # Check timeseries has enough data before plotting
-             if timeseries and len(timeseries.get('timestamps_rel_s', [])) >= 2:
-                 plot_filename = os.path.join(plot_dir, f"run_{i+1:03d}_resources.png")
-                 generate_plot(i + 1, args.runs, timeseries, plot_filename, command_str_short)
-             elif timeseries:
-                  print(f"[Run {i+1}/{args.runs}] Skipping plot due to insufficient timeseries data ({len(timeseries.get('timestamps_rel_s',[]))} points).", file=sys.stderr)
+        current_command_results = []
+
+        # --- Warm-up Runs (for this command) ---
+        if args.warmup > 0:
+            print(f"[Cmd {cmd_idx+1}] Starting {args.warmup} warm-up run(s)...", file=sys.stderr)
+            for i in range(args.warmup):
+                run_prefix = f"[Cmd {cmd_idx+1} Warmup {i+1}/{args.warmup}]"
+                run_command(command_list, command_str, run_prefix,
+                            monitor_interval=args.interval, monitor_gpu=gpu_enabled_arg,
+                            timeout=args.timeout, verbose_level=args.verbose)
+            print(f"[Cmd {cmd_idx+1}] Warm-up complete.", file=sys.stderr)
+            print("-" * 10, file=sys.stderr)
+
+        # --- Benchmark Runs (for this command) ---
+        print(f"[Cmd {cmd_idx+1}] Starting {args.runs} benchmark run(s)...", file=sys.stderr)
+        for i in range(args.runs):
+            run_prefix = f"[Cmd {cmd_idx+1} Run {i+1}/{args.runs}]"
+            duration, summary, timeseries, exit_code = run_command(
+                command_list, command_str, run_prefix,
+                monitor_interval=args.interval, monitor_gpu=gpu_enabled_arg,
+                timeout=args.timeout, verbose_level=args.verbose
+                )
+
+            if duration is None or summary is None or timeseries is None or exit_code is None:
+                 print(f"{run_prefix} Failed. Skipping results and plot for this run.", file=sys.stderr)
+                 # Optionally store failure info? For now, just skip.
+                 continue
+
+            run_data = {
+                "run": i + 1,
+                "duration_s": duration,
+                "exit_code": exit_code,
+                "summary": summary,
+                "timeseries": timeseries
+            }
+            current_command_results.append(run_data)
+
+            # Print intermediate result summary for this run
+            res_str = f"Time: {format_duration(duration)}, CPU Max: {summary.get('cpu_percent_max', 'N/A'):.1f}%, Mem Max: {summary.get('memory_rss_mb_max', 'N/A'):.1f} MB"
+            gpu_max_util = summary.get('gpu_utilization_percent_max', float('nan'))
+            gpu_max_mem = summary.get('gpu_memory_used_mb_max', float('nan'))
+            if gpu_enabled_arg and NVIDIA_GPU_SUPPORT and not math.isnan(gpu_max_util):
+                 res_str += f", GPU Max: {gpu_max_util:.1f}%, GPU Mem Max: {gpu_max_mem:.1f} MB"
+            if summary.get("monitoring_error"):
+                 res_str += f" (Monitor Warn: {summary['monitoring_error']})"
+            print(f"{run_prefix} {res_str}")
 
 
-    print("-" * 20, file=sys.stderr)
-    print("Benchmark Complete.")
+            # Generate plot for this individual run if requested
+            if plot_dir:
+                if timeseries and len(timeseries.get('timestamps_rel_s', [])) >= 2:
+                     # Use command index and run index for unique filenames
+                     sanitized_cmd_part = sanitize_filename(f"cmd_{cmd_idx+1}")
+                     plot_filename = os.path.join(plot_dir, f"{sanitized_cmd_part}_run_{i+1:03d}_resources.png")
+                     generate_plot(cmd_idx, i + 1, args.runs, timeseries, plot_filename, command_str)
+                elif timeseries:
+                     print(f"{run_prefix} Skipping plot due to insufficient timeseries data.", file=sys.stderr)
 
-    # --- Aggregate and Print Final Summary ---
-    if not run_results:
-        print("\nNo successful runs completed. Cannot provide summary.")
-        # Cleanup NVML even on failure
-        if NVIDIA_GPU_SUPPORT: pynvml.nvmlShutdown()
+        # Store results for this command
+        all_results[command_str] = current_command_results
+
+        # Generate average plot for this command if requested
+        if plot_dir and current_command_results:
+             sanitized_cmd_part = sanitize_filename(f"cmd_{cmd_idx+1}")
+             avg_plot_filename = os.path.join(plot_dir, f"{sanitized_cmd_part}_average_resources.png")
+             generate_average_plot(cmd_idx, current_command_results, avg_plot_filename, command_str)
+
+    # --- End of loop through commands ---
+
+    print("=" * 30, file=sys.stderr)
+    print("Benchmark Complete.", file=sys.stderr)
+
+    # --- Aggregate and Print Final Comparison Summary ---
+    summarized_results = []
+    for command_str, results_list in all_results.items():
+        if results_list: # Only summarize if there were successful runs
+            stats = calculate_summary_stats(results_list, command_str)
+            summarized_results.append(stats)
+        else:
+             # Include a basic entry for commands that failed completely
+             summarized_results.append({"command": command_str, "runs": 0, "successful_runs": 0})
+
+    if not summarized_results:
+        print("\nNo commands were successfully benchmarked.")
+        # Cleanup NVML
+        if NVIDIA_GPU_SUPPORT and gpu_enabled_arg: pynvml.nvmlShutdown()
         sys.exit(1)
 
-    # ... [Summary printing code remains the same] ...
-    valid_durations = [r['duration_s'] for r in run_results]
-    avg_duration = statistics.mean(valid_durations)
-    min_duration = min(valid_durations)
-    max_duration = max(valid_durations)
-    stdev_duration = statistics.stdev(valid_durations) if len(valid_durations) > 1 else 0.0
+    # Sort results by average time (fastest first) for comparison
+    summarized_results.sort(key=lambda x: x.get("time_avg_s", float('inf')))
 
-    print("\n--- Summary ---")
-    print(f"Command: {command_str_short}")
-    print(f"Total successful runs: {len(run_results)}")
+    print("\n--- Comparison Summary ---")
 
-    print("\nExecution Time:")
-    print(f"  Average: {format_duration(avg_duration)}")
-    print(f"  Min:     {format_duration(min_duration)}")
-    print(f"  Max:     {format_duration(max_duration)}")
-    print(f"  StdDev:  {format_duration(stdev_duration)}")
+    # Find the fastest average time for relative comparison
+    fastest_avg_time = min(r.get("time_avg_s", float('inf')) for r in summarized_results if r.get("successful_runs", 0) > 0)
+    if fastest_avg_time == float('inf'): fastest_avg_time = None # Handle case where no runs succeeded
 
-    def aggregate_summary_stat(key):
-        values = [r['summary'].get(key) for r in run_results if r['summary'].get(key) is not None and math.isfinite(r['summary'].get(key))]
-        if not values: return float('nan')
-        return statistics.mean(values)
+    # Determine max command length for formatting
+    max_cmd_len = max(len(r['command']) for r in summarized_results)
+    max_cmd_len = min(max_cmd_len, 60) # Cap length for display
 
-    avg_cpu_max = aggregate_summary_stat('cpu_percent_max')
-    avg_cpu_avg = aggregate_summary_stat('cpu_percent_avg')
-    avg_mem_max = aggregate_summary_stat('memory_rss_mb_max')
-    avg_mem_avg = aggregate_summary_stat('memory_rss_mb_avg')
+    # Header
+    header = f"{'Command':<{max_cmd_len}} | {'Avg Time':>12} | {'Relative':>10} | {'Min Time':>12} | {'Max Time':>12} | {'Avg Max Mem':>12} | {'Avg Max CPU':>12}"
+    gpu_header = f" | {'Avg Max GPU %':>14} | {'Avg Max GPU Mem':>15}" if gpu_enabled_arg and NVIDIA_GPU_SUPPORT else ""
+    print(header + gpu_header)
+    print("-" * len(header + gpu_header))
 
-    print("\nResource Usage (Averages across runs):")
-    print(f"  Avg CPU Usage (Avg): {avg_cpu_avg:.1f}%")
-    print(f"  Avg CPU Usage (Max): {avg_cpu_max:.1f}%")
-    print(f"  Avg Memory RSS (Avg): {avg_mem_avg:.1f} MB")
-    print(f"  Avg Memory RSS (Max): {avg_mem_max:.1f} MB")
+    # Data Rows
+    for stats in summarized_results:
+        cmd_display = stats['command'][:max_cmd_len] + ('...' if len(stats['command']) > max_cmd_len else '')
+        if stats.get("successful_runs", 0) == 0:
+            print(f"{cmd_display:<{max_cmd_len}} | {'-'*12} | {'-'*10} | {'-'*12} | {'-'*12} | {'-'*12} | {'-'*12}" + (f" | {'-'*14} | {'-'*15}" if gpu_enabled_arg and NVIDIA_GPU_SUPPORT else ""))
+            continue
 
-    if args.gpu and NVIDIA_GPU_SUPPORT:
-         avg_gpu_util_max = aggregate_summary_stat('gpu_utilization_percent_max')
-         avg_gpu_util_avg = aggregate_summary_stat('gpu_utilization_percent_avg')
-         avg_gpu_mem_max = aggregate_summary_stat('gpu_memory_used_mb_max')
-         avg_gpu_mem_avg = aggregate_summary_stat('gpu_memory_used_mb_avg')
+        avg_time_s = stats.get('time_avg_s', float('nan'))
+        min_time_s = stats.get('time_min_s', float('nan'))
+        max_time_s = stats.get('time_max_s', float('nan'))
+        avg_max_mem = stats.get('mem_max_avg', float('nan'))
+        avg_max_cpu = stats.get('cpu_max_avg', float('nan'))
 
-         if not math.isnan(avg_gpu_util_max): # Check one metric is enough
-             print(f"  Avg GPU Utilization (Avg): {avg_gpu_util_avg:.1f}%")
-             print(f"  Avg GPU Utilization (Max): {avg_gpu_util_max:.1f}%")
-             print(f"  Avg GPU Memory Used (Avg): {avg_gpu_mem_avg:.1f} MB") # System-wide
-             print(f"  Avg GPU Memory Used (Max): {avg_gpu_mem_max:.1f} MB")
-         else:
-              print("  GPU monitoring enabled, but no valid GPU data collected across run summaries.")
+        relative_speed = f"{(avg_time_s / fastest_avg_time):.2f}x" if fastest_avg_time and not math.isnan(avg_time_s) else "-"
 
-    monitoring_errors = [r['summary']['monitoring_error'] for r in run_results if 'monitoring_error' in r['summary']]
-    if monitoring_errors:
-         print(f"\nNote: Encountered {len(monitoring_errors)} monitoring issue(s) during the runs.")
+        time_str = format_duration(avg_time_s)
+        min_time_str = format_duration(min_time_s)
+        max_time_str = format_duration(max_time_s)
+        mem_str = f"{avg_max_mem:.1f} MB" if not math.isnan(avg_max_mem) else "-"
+        cpu_str = f"{avg_max_cpu:.1f}%" if not math.isnan(avg_max_cpu) else "-"
+
+        row = f"{cmd_display:<{max_cmd_len}} | {time_str:>12} | {relative_speed:>10} | {min_time_str:>12} | {max_time_str:>12} | {mem_str:>12} | {cpu_str:>12}"
+
+        if gpu_enabled_arg and NVIDIA_GPU_SUPPORT:
+            avg_max_gpu_util = stats.get('gpu_util_max_avg', float('nan'))
+            avg_max_gpu_mem = stats.get('gpu_mem_max_avg', float('nan'))
+            gpu_util_str = f"{avg_max_gpu_util:.1f}%" if not math.isnan(avg_max_gpu_util) else "-"
+            gpu_mem_str = f"{avg_max_gpu_mem:.1f} MB" if not math.isnan(avg_max_gpu_mem) else "-"
+            row += f" | {gpu_util_str:>14} | {gpu_mem_str:>15}"
+
+        print(row)
 
 
-    # --- Generate Average Plot ---
     if plot_dir:
-        avg_plot_filename = os.path.join(plot_dir, "average_resources.png")
-        generate_average_plot(run_results, avg_plot_filename, command_str_short)
-        print(f"\nIndividual run plots and average plot saved in: {os.path.abspath(plot_dir)}")
-    else:
-         # Ensure plots aren't mentioned if disabled
-         pass
-
+        print(f"\nPlots for each run and command average saved in: {os.path.abspath(plot_dir)}")
 
     # Cleanup NVML
-    if NVIDIA_GPU_SUPPORT:
+    if NVIDIA_GPU_SUPPORT and gpu_enabled_arg:
         try:
             pynvml.nvmlShutdown()
         except pynvml.NVMLError:
             pass # Ignore shutdown errors
 
 
+# --- Entry Point ---
 def entry_point():
     """Handles argument parsing and calls the main benchmark logic."""
     parser = argparse.ArgumentParser(
-        description="Benchmark a command-line command for execution time and resource usage, with optional plotting.",
+        description="Benchmark and compare command-line commands for execution time and resource usage.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="Example: cmdbench --plot-dir ./plots -n 3 --gpu -- my_program arg1"
+        # Updated epilog example
+        epilog="Example: cmdbench --plot-dir ./plots -n 5 --gpu -- 'sleep 1' 'echo hello && sleep 0.5'"
     )
-    # Add all arguments previously defined in the if __name__ == "__main__": block
+    # --- General Options ---
     parser.add_argument(
         "-n", "--runs", type=int, default=3,
-        help="Number of times to run the command for benchmarking."
+        help="Number of times to run EACH command for benchmarking."
     )
     parser.add_argument(
         "-w", "--warmup", type=int, default=1,
-        help="Number of warm-up runs to perform before benchmarking."
+        help="Number of warm-up runs to perform before benchmarking EACH command."
     )
     parser.add_argument(
         "-i", "--interval", type=float, default=0.1,
         help="Resource monitoring interval in seconds."
     )
     parser.add_argument(
-        "--gpu", action="store_true",
-        help="Enable NVIDIA GPU monitoring (requires 'pip install cmdbench[gpu]' and NVIDIA driver)."
-    )
-    parser.add_argument(
         "--timeout", type=float, default=None,
-        help="Set a timeout in seconds for each command run."
-    )
-    parser.add_argument(
-        "--plot-dir", type=str, default=None,
-        help="Directory to save resource usage plots (individual runs + average)."
+        help="Set a timeout in seconds for EACH command run."
     )
     parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase verbosity. -v shows run output hints, -vv shows full stdout/stderr."
     )
+
+    # --- Resource Monitoring ---
     parser.add_argument(
-        "command", nargs=argparse.REMAINDER,
-        help="The command and its arguments to benchmark."
+        "--gpu", action="store_true",
+        help="Enable NVIDIA GPU monitoring (requires 'pip install cmdbench[gpu]' and NVIDIA driver)."
+    )
+
+    # --- Plotting ---
+    parser.add_argument(
+        "--plot-dir", type=str, default=None,
+        help="Directory to save resource usage plots (individual runs + average per command)."
+    )
+
+    # --- Command(s) to Run ---
+    parser.add_argument(
+        "command", # Changed from nargs=REMAINDER
+        nargs='+', # Expect one or more command strings
+        metavar='COMMAND', # Help text hint
+        help="One or more command strings to benchmark and compare. Enclose commands with spaces in quotes."
     )
 
     args = parser.parse_args()
@@ -798,7 +834,9 @@ def entry_point():
     if args.plot_dir and not PLOTTING_SUPPORT:
          print("Error: Plotting requested (--plot-dir), but matplotlib/numpy/scipy are not installed correctly.", file=sys.stderr)
          print("Please ensure these libraries are installed in your environment.", file=sys.stderr)
-         sys.exit(1) # Exit if plotting requested but libs missing
+         sys.exit(1)
+
+    run_benchmark_logic(args)
 
 
-    run_benchmark_logic(args) # Call the main logic function
+# --- No if __name__ == "__main__": block needed when using entry_point ---
