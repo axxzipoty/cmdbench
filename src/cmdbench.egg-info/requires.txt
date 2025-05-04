@@ -1,0 +1,7 @@
+psutil~=7.0.0
+matplotlib~=3.10.1
+numpy~=2.2.5
+scipy~=1.15.2
+
+[gpu]
+nvidia-ml-py~=12.570.86

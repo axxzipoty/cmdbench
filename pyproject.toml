@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmdbench"
+version = "0.2.0" # Increment version as you make changes
+authors = [
+  { name="Your Name", email="your_email@example.com" }, # Optional: Replace with your details
+]
+description = "A command-line tool to benchmark commands, measuring execution time, CPU, RAM, and optional GPU usage."
+readme = "README.md" # Optional: if you create a README
+requires-python = ">=3.12" # Specify minimum Python version
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # Choose a license (e.g., MIT)
+    "Operating System :: OS Independent",
+    "Topic :: System :: Benchmark",
+    "Topic :: Utilities",
+    "Environment :: Console",
+]
+keywords = ["benchmark", "cli", "performance", "cpu", "memory", "gpu", "profiling"]
+
+# Core dependencies needed for basic operation + plotting
+dependencies = [
+    "psutil ~= 7.0.0",
+    "matplotlib ~= 3.10.1",
+    "numpy ~= 2.2.5",
+    "scipy ~= 1.15.2",
+]
+
+# Optional dependencies - install with `pip install cmdbench[gpu]`
+[project.optional-dependencies]
+gpu = ["nvidia-ml-py ~= 12.570.86"] # Or the appropriate version/name
+
+# Define the command-line script entry point
+[project.scripts]
+cmdbench = "cmdbench.main:entry_point"
+
+# Optional: Links for documentation or source code
+# [project.urls]
+# "Homepage" = "https://github.com/yourusername/cmdbench-pkg"
+# "Bug Tracker" = "https://github.com/yourusername/cmdbench-pkg/issues"
